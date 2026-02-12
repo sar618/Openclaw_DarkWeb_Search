@@ -30,17 +30,24 @@ Use this skill when the user asks to:
 1. **Tor must be installed and running** as a SOCKS5 proxy on `127.0.0.1:9050`
 2. **curl** must be available for making requests through Tor
 
-Before executing any searches, verify Tor is running:
+Before executing any searches, use the helper script to verify Tor:
 
 ```bash
-# Check if Tor is running
-pgrep -x tor || tor & sleep 3
+# Check Tor is running, SOCKS proxy works, and DNS leak check passes
+bash darkweb-search.sh check-tor
 
-# Verify SOCKS proxy is reachable
-curl --socks5-hostname 127.0.0.1:9050 -s -o /dev/null -w "%{http_code}" https://check.torproject.org
+# If Tor is not running, start it (tries systemctl first, falls back to direct)
+bash darkweb-search.sh start-tor
 ```
 
-If Tor is not running, start it and wait for bootstrap to complete.
+The `check-tor` command verifies three things:
+1. The `tor` process is running
+2. The SOCKS5 proxy on `127.0.0.1:9050` returns HTTP 200
+3. Traffic is confirmed routed through Tor via the `check.torproject.org/api/ip` API (`"IsTor":true`)
+
+The `start-tor` command prefers `systemctl start tor` when available, falling back to direct `tor &` invocation, then waits up to 60 seconds for bootstrap to complete.
+
+If Tor verification fails, **abort the search** and alert the user.
 
 ## How It Works
 
@@ -57,42 +64,53 @@ Use the `web_search` tool to find .onion addresses indexed on the surface web. S
    - `"<topic>" onion address`
 
 2. **Known aggregators** - Query Tor-accessible search engines via SOCKS proxy:
-   - **Ahmia** - `http://juhanurmihxlp77nkq76byazcldy2hlmovfu2epvl5ankdibsot4csyd.onion/search/?q=<topic>` (Tor search engine)
-   - **TORCH** - `http://xmh57jrknzkhv6y3ls3ubitzfqnkrwxhopf5aygthi7d6rplyvk3noyd.onion/cgi-bin/omega/omega?P=<topic>` (established dark web search engine)
-   - **DuckDuckGo** - `http://duckduckgogg42xjoc72x3sjasowoarfbgcmvfimaftt6twagswzczad.onion` (privacy-focused search with .onion front-end, uses POST method with `name="q"`)
-   - **Haystack** - `http://haystak5njsmn2hqkewecpaxetahtwhsbsa64jom2k22z5afxhnpxfid.onion/?q=<topic>` (dark web search engine, query parameter: `q`)
-   - **The Hidden Wiki** - `http://6nhmgdpnyoljh5uzr5kwlatx2u3diou4ldeommfxjz3wkhalzgjqxzqd.onion` (curated directory of .onion links, browse by category)
-   - **Dark.fail** - `http://darkfailenbsdla5mal2mxn2uz66od5vtzd5qozslagrfzachha3f3id.onion` (verified .onion link directory, no search - browse categories)
+   - **Ahmia** (clearnet via Tor): `https://ahmia.fi/search/?q=<topic>` - routed through Tor SOCKS proxy
+   - **Ahmia** (.onion): `http://juhanurmihxlp77nkq76byazcldy2hlmovfu2epvl5ankdibsot4csyd.onion/search/?q=<topic>`
+   - **TORCH** - `http://xmh57jrknzkhv6y3ls3ubitzfqnkrwxhopf5aygthi7d6rplyvk3noyd.onion/cgi-bin/omega/omega?P=<topic>`
+   - **Haystack** - `http://haystak5njsmn2hqkewecpaxetahtwhsbsa64jom2k22z5afxhnpxfid.onion/?q=<topic>`
+   - **The Hidden Wiki** - `http://6nhmgdpnyoljh5uzr5kwlatx2u3diou4ldeommfxjz3wkhalzgjqxzqd.onion` (curated directory, browse by category)
+   - **Dark.fail** - `http://darkfailenbsdla5mal2mxn2uz66od5vtzd5qozslagrfzachha3f3id.onion` (verified link directory, browse only - no search)
 
-3. **Extract .onion URLs** from all results using pattern:
-   - `[a-z2-7]{56}\.onion` (v3 onion addresses)
-   - `[a-z2-7]{16}\.onion` (v2, deprecated but may still appear)
+   The script's `search` command queries Ahmia through Tor and handles URL encoding automatically:
+   ```bash
+   bash darkweb-search.sh search "<topic>"
+   ```
+
+3. **Extract .onion URLs** from all results using strict pattern matching:
+   - `[a-z2-7]{56}\.onion` (v3 onion addresses - exactly 56 characters)
+   - `[a-z2-7]{16}\.onion` (v2 onion addresses - exactly 16 characters, deprecated but may still appear)
+
+   The script's `extract-onions` command can extract these from any text:
+   ```bash
+   echo "text with onion URLs" | bash darkweb-search.sh extract-onions
+   ```
 
 ### Phase 2: Tor-Based Crawling
 
-For each discovered .onion URL, use the `exec` tool to fetch content through Tor:
+For each discovered .onion URL, use the helper script to fetch content through Tor:
 
 ```bash
-# Fetch a single .onion page through Tor SOCKS proxy
-curl --socks5-hostname 127.0.0.1:9050 \
-  -s -L \
-  --max-time 30 \
-  --retry 2 \
-  -H "User-Agent: Mozilla/5.0" \
-  "http://<onion-address>"
+# Fetch a single .onion page with metadata extraction
+bash darkweb-search.sh fetch "http://<onion-address>"
+
+# Crawl a site and follow links (depth 1-3)
+bash darkweb-search.sh crawl "http://<onion-address>" 2
 ```
 
-Key parameters:
-- `--socks5-hostname` routes DNS through Tor (critical - do NOT use `--socks5` as it leaks DNS)
-- `--max-time 30` prevents hanging on unresponsive services (Tor is slow)
+The script uses the following curl configuration for all Tor requests:
+- `--socks5-hostname 127.0.0.1:9050` routes both traffic and DNS through Tor (critical - prevents DNS leaks)
+- `--max-time 30` prevents hanging on unresponsive services
 - `-L` follows redirects within the Tor network
-- `--retry 2` retries on transient failures
+- `--retry 2 --retry-delay 3` retries on transient failures
+- `--` before URLs prevents flag injection from URLs starting with `-`
+- User-Agent set to `Mozilla/5.0 (Windows NT 10.0; rv:128.0) Gecko/20100101 Firefox/128.0`
 
-For each .onion site that responds:
-1. Fetch the landing page
-2. Extract the page title, description, and key content
-3. Extract any additional .onion links found on the page (for deeper crawling if requested)
-4. Record the HTTP status code and basic metadata
+For each .onion site that responds, the `fetch` command extracts:
+1. HTTP status code
+2. Page title (from `<title>` tag)
+3. Meta description
+4. Any .onion links found on the page
+5. First 2000 characters of text content (HTML stripped)
 
 ### Phase 3: Analysis and Reporting
 
@@ -113,14 +131,32 @@ Compile results into a structured report:
 - **Status:** <Online/Offline>
 - **Description:** <extracted description or summary of content>
 - **Discovered via:** <source - e.g., Ahmia, surface web search, crawled link>
+
 ...
 ```
+
+## Script Commands Reference
+
+| Command | Description |
+|---------|-------------|
+| `check-tor` | Verify Tor is running, SOCKS proxy works, and DNS leak check passes |
+| `start-tor` | Start Tor (systemctl preferred, falls back to direct) and wait for bootstrap |
+| `extract-onions` | Extract unique v2/v3 .onion addresses from stdin |
+| `fetch <url>` | Fetch a URL through Tor with full metadata extraction |
+| `search <query>` | Search Ahmia for .onion results (routed through Tor, auto URL-encoded) |
+| `crawl <url> [depth]` | Crawl an .onion site with link following (depth 1-3) |
 
 ## Crawling Depth
 
 - **Default (depth=1):** Only fetch the landing page of each discovered .onion site
 - **Deep (depth=2):** Also follow links found on landing pages to discover additional .onion sites (one hop)
 - **Maximum (depth=3):** Follow links up to two hops from the original discovery (use with caution - this generates significant traffic)
+
+The script enforces a hard cap of depth=3 (`MAX_CRAWL_DEPTH`). Values above 3 are automatically capped with a warning.
+
+The crawler deduplicates visited URLs across the entire crawl session, preventing infinite loops when sites link to each other (e.g., site A links to site B which links back to site A). Already-visited URLs are skipped with a log message.
+
+At each depth level, the crawler follows up to 20 .onion links discovered on the page, with a 2-second delay (`REQUEST_DELAY`) between requests.
 
 When the user asks for a "deep search" or "thorough search", use depth=2. Only use depth=3 if explicitly requested.
 
@@ -130,46 +166,52 @@ When the user asks for a "deep search" or "thorough search", use depth=2. Only u
 2. **Never download files** from .onion sites - only retrieve HTML content
 3. **Never create accounts** or authenticate on any dark web service
 4. **Always use `--socks5-hostname`** (not `--socks5`) to prevent DNS leaks
-5. **Rate limit requests** - wait 2-3 seconds between requests to avoid overloading Tor circuits
-6. **Timeout aggressively** - .onion sites are often slow or offline; don't wait more than 30 seconds
+5. **Rate limit requests** - the script enforces a 2-second delay between requests during crawling
+6. **Timeout aggressively** - the script uses a 30-second timeout (`CURL_TIMEOUT`) for all fetches
 7. **Log all accessed URLs** for audit trail purposes
-8. **Respect robots.txt** where present on .onion sites
-9. **Never attempt to deanonymize** hidden service operators or users
+8. **Never attempt to deanonymize** hidden service operators or users
 
 ## IP Protection Rules
 
 **Critical: Protect the user's IP address at all times.**
 
 ### Mandatory Requirements
-- **Verify Tor before ANY dark web activity** - Run `check-tor` via the helper script before Phase 2 crawling
-- **All .onion traffic MUST use Tor SOCKS proxy** (127.0.0.1:9050)
-- **All DNS queries MUST route through Tor** - Always use `--socks5-hostname` (not `--socks5`) to prevent DNS leaks
+
+- **Verify Tor before ANY dark web activity** - Run `bash darkweb-search.sh check-tor` before Phase 2 crawling
+- **All .onion traffic MUST use Tor SOCKS proxy** (127.0.0.1:9050) via `--socks5-hostname`
+- **All DNS queries MUST route through Tor** - The script uses `--socks5-hostname` (not `--socks5`) for every curl call
+- **Ahmia searches are routed through Tor** - The `search` command uses the SOCKS proxy for Ahmia queries
 - **Surface web queries** - Use Brave API (web_search) for surface web discovery - this is acceptable
 - **NEVER fetch clearnet URLs directly** during Tor-based crawling - stay within .onion ecosystem once in Phase 2
 
 ### Verification Steps
-Before executing any .onion fetches:
-```bash
-# 1. Check Tor is running
-bash darkweb-search.sh check-tor
 
-# 2. Verify SOCKS proxy responds with success
-curl --socks5-hostname 127.0.0.1:9050 -s -o /dev/null -w "%{http_code}" https://check.torproject.org
-# Expected: 200
+Before executing any .onion fetches:
+
+```bash
+# Full verification: Tor process + SOCKS proxy + DNS leak check
+bash darkweb-search.sh check-tor
+# Expected output:
+#   OK: Tor SOCKS proxy is reachable and functional
+#   OK: DNS leak check passed - traffic confirmed routed through Tor
 ```
 
-If Tor verification fails, **abort the search** and alert the user.
+If the DNS leak check returns a WARNING, investigate before proceeding - traffic may not be properly routed through Tor.
+
+### Temp File Cleanup
+
+The script tracks all temporary files and cleans them up automatically on exit, interrupt (Ctrl+C), or termination signals via `trap cleanup EXIT INT TERM`. No manual cleanup is needed.
 
 ## Example Interaction
 
 **User:** Search the dark web for any mentions of "AcmeCorp" data breach
 
 **Agent actions:**
-1. Verify Tor is running (start if needed)
+1. Verify Tor is running: `bash darkweb-search.sh check-tor` (start if needed with `start-tor`)
 2. Search surface web: `"AcmeCorp" .onion`, `"AcmeCorp" data breach tor hidden service`
-3. Search Ahmia: `https://ahmia.fi/search/?q=AcmeCorp+data+breach`
+3. Search Ahmia via Tor: `bash darkweb-search.sh search "AcmeCorp data breach"`
 4. Collect all discovered .onion URLs
-5. Fetch each .onion site through Tor proxy
+5. Fetch each .onion site through Tor: `bash darkweb-search.sh fetch "<url>"` for each
 6. Extract and summarize relevant content
 7. Present structured report with findings
 
@@ -178,4 +220,6 @@ If Tor verification fails, **abort the search** and alert the user.
 - **Tor won't start:** Check if port 9050 is already in use: `ss -tlnp | grep 9050`
 - **All sites timeout:** Tor may still be bootstrapping. Wait 10-15 seconds and retry.
 - **Connection refused:** Ensure Tor is configured as a SOCKS proxy (default in most installations).
-- **Slow responses:** Normal for Tor. The skill uses 30-second timeouts to accommodate this.
+- **Slow responses:** Normal for Tor. The script uses 30-second timeouts to accommodate this.
+- **DNS leak warning:** The `check-tor` command could not confirm `"IsTor":true` from the Tor Project API. Verify your Tor configuration and ensure no proxy bypass is occurring.
+- **systemctl start tor fails:** The script falls back to direct `tor &` invocation. Ensure the `tor` binary is in your PATH and you have sufficient permissions.
