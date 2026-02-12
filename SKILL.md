@@ -63,18 +63,27 @@ Use the `web_search` tool to find .onion addresses indexed on the surface web. S
    - `"<topic>" hidden service tor`
    - `"<topic>" onion address`
 
-2. **Known aggregators** - Query Tor-accessible search engines via SOCKS proxy:
-   - **Ahmia** (clearnet via Tor): `https://ahmia.fi/search/?q=<topic>` - routed through Tor SOCKS proxy
-   - **Ahmia** (.onion): `http://juhanurmihxlp77nkq76byazcldy2hlmovfu2epvl5ankdibsot4csyd.onion/search/?q=<topic>`
-   - **TORCH** - `http://xmh57jrknzkhv6y3ls3ubitzfqnkrwxhopf5aygthi7d6rplyvk3noyd.onion/cgi-bin/omega/omega?P=<topic>`
-   - **Haystack** - `http://haystak5njsmn2hqkewecpaxetahtwhsbsa64jom2k22z5afxhnpxfid.onion/?q=<topic>`
-   - **The Hidden Wiki** - `http://6nhmgdpnyoljh5uzr5kwlatx2u3diou4ldeommfxjz3wkhalzgjqxzqd.onion` (curated directory, browse by category)
-   - **Dark.fail** - `http://darkfailenbsdla5mal2mxn2uz66od5vtzd5qozslagrfzachha3f3id.onion` (verified link directory, browse only - no search)
+2. **Multi-engine search** - The `search` command tries multiple strategies automatically:
 
-   The script's `search` command queries Ahmia through Tor and handles URL encoding automatically:
+   > **Note:** Most .onion search engines (Ahmia, TORCH, Haystack) now require JavaScript to render results. The script uses non-JS approaches where possible.
+
+   The script runs four strategies in sequence:
+   1. **Ahmia JSON API** - Requests `?format=json` from Ahmia (no JS required)
+   2. **Ahmia .onion mirror** - Queries the Tor-native Ahmia address directly
+   3. **TORCH .onion** - Queries TORCH search engine via Tor
+   4. **Surface web discovery** - Searches DuckDuckGo HTML (lite, no JS) for `.onion` references on the clearnet
+
+   Results from all strategies are deduplicated and combined.
+
    ```bash
    bash darkweb-search.sh search "<topic>"
    ```
+
+   **Known .onion directories** (for manual browsing via `crawl`):
+   - **The Hidden Wiki** - `http://6nhmgdpnyoljh5uzr5kwlatx2u3diou4ldeommfxjz3wkhalzgjqxzqd.onion` (curated directory, browse by category)
+   - **Dark.fail** - `http://darkfailenbsdla5mal2mxn2uz66od5vtzd5qozslagrfzachha3f3id.onion` (verified link directory, browse only - no search)
+
+   If the `search` command returns no results, try crawling these directories or use the agent's `web_search` tool for broader surface web discovery.
 
 3. **Extract .onion URLs** from all results using strict pattern matching:
    - `[a-z2-7]{56}\.onion` (v3 onion addresses - exactly 56 characters)
@@ -143,7 +152,7 @@ Compile results into a structured report:
 | `start-tor` | Start Tor (systemctl preferred, falls back to direct) and wait for bootstrap |
 | `extract-onions` | Extract unique v2/v3 .onion addresses from stdin |
 | `fetch <url>` | Fetch a URL through Tor with full metadata extraction |
-| `search <query>` | Search Ahmia for .onion results (routed through Tor, auto URL-encoded) |
+| `search <query>` | Multi-engine .onion search: Ahmia JSON API, Ahmia .onion, TORCH, surface web (auto URL-encoded) |
 | `crawl <url> [depth]` | Crawl an .onion site with link following (depth 1-3) |
 
 ## Crawling Depth
@@ -223,3 +232,4 @@ The script tracks all temporary files and cleans them up automatically on exit, 
 - **Slow responses:** Normal for Tor. The script uses 30-second timeouts to accommodate this.
 - **DNS leak warning:** The `check-tor` command could not confirm `"IsTor":true` from the Tor Project API. Verify your Tor configuration and ensure no proxy bypass is occurring.
 - **systemctl start tor fails:** The script falls back to direct `tor &` invocation. Ensure the `tor` binary is in your PATH and you have sufficient permissions.
+- **Search returns no results:** Most .onion search engines now require JavaScript. The script uses Ahmia's JSON API and DuckDuckGo HTML (lite) to avoid this. If still no results, try crawling known directories (Hidden Wiki, Dark.fail) or use the agent's `web_search` tool for surface web `.onion` discovery.
