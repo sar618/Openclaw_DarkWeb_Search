@@ -6,7 +6,7 @@
 #   darkweb-search.sh start-tor       - Start Tor and wait for bootstrap
 #   darkweb-search.sh extract-onions  - Extract .onion URLs from stdin
 #   darkweb-search.sh fetch <url>     - Fetch a URL through Tor
-#   darkweb-search.sh search <query>  - Search Ahmia for .onion results
+#   darkweb-search.sh search <query>  - Search for .onion results (multi-engine)
 #   darkweb-search.sh crawl <url> [depth] - Crawl an .onion site for links
 set -euo pipefail
 
@@ -204,36 +204,149 @@ fetch_with_metadata() {
     echo ""
 }
 
-search_ahmia() {
+search_darkweb() {
     local query="$1"
     local encoded_query
     encoded_query=$(urlencode "$query")
+    local all_onions=""
 
-    echo "Searching Ahmia for: $query"
+    echo "Dark web search for: $query"
     echo ""
 
-    # Route Ahmia search through Tor to prevent clearnet traffic exposure
-    local results
-    results=$(curl --socks5-hostname "$TOR_PROXY" \
+    # Strategy 1: Ahmia JSON API (does not require JavaScript)
+    echo "[1/4] Trying Ahmia JSON API..."
+    local ahmia_json
+    ahmia_json=$(curl --socks5-hostname "$TOR_PROXY" \
         -s -L \
-        --max-time 15 \
-        -- "https://ahmia.fi/search/?q=${encoded_query}" 2>/dev/null || echo "")
+        --max-time 20 \
+        -H "Accept: application/json" \
+        -- "https://ahmia.fi/search/?q=${encoded_query}&format=json" 2>/dev/null || echo "")
 
-    if [ -z "$results" ]; then
-        echo "ERROR: Failed to reach Ahmia"
-        return 1
-    fi
-
-    # Extract .onion URLs from Ahmia results
-    local onion_urls
-    onion_urls=$(echo "$results" | grep -oiE 'https?://[a-z2-7]{16,56}\.onion[^ "<>]*' | sort -u || true)
-
-    if [ -n "$onion_urls" ]; then
-        echo "Discovered .onion URLs:"
-        echo "$onion_urls"
+    if [ -n "$ahmia_json" ] && echo "$ahmia_json" | grep -q '"onion_url"' 2>/dev/null; then
+        local ahmia_onions
+        ahmia_onions=$(echo "$ahmia_json" | grep -oiE 'https?://[a-z2-7]{16,56}\.onion[^ "<>,"]*' | sort -u || true)
+        if [ -n "$ahmia_onions" ]; then
+            echo "  Found results via Ahmia JSON API"
+            all_onions="${all_onions}${ahmia_onions}"$'\n'
+        fi
     else
-        echo "No .onion URLs found for this query"
+        echo "  Ahmia JSON API returned no structured results"
     fi
+
+    # Strategy 2: Ahmia .onion address (direct Tor, may server-render)
+    echo "[2/4] Trying Ahmia .onion mirror..."
+    local ahmia_onion_results
+    ahmia_onion_results=$(curl --socks5-hostname "$TOR_PROXY" \
+        -s -L \
+        --max-time 25 \
+        -H "User-Agent: Mozilla/5.0 (Windows NT 10.0; rv:128.0) Gecko/20100101 Firefox/128.0" \
+        -- "http://juhanurmihxlp77nkq76byazcldy2hlmovfu2epvl5ankdibsot4csyd.onion/search/?q=${encoded_query}" 2>/dev/null || echo "")
+
+    if [ -n "$ahmia_onion_results" ]; then
+        local onion_mirror_urls
+        onion_mirror_urls=$(echo "$ahmia_onion_results" | grep -oiE 'https?://[a-z2-7]{16,56}\.onion[^ "<>]*' \
+            | grep -v 'juhanurmihxlp77nkq76byazcldy2hlmovfu2epvl5ankdibsot4csyd' \
+            | sort -u || true)
+        if [ -n "$onion_mirror_urls" ]; then
+            echo "  Found results via Ahmia .onion mirror"
+            all_onions="${all_onions}${onion_mirror_urls}"$'\n'
+        else
+            echo "  Ahmia .onion mirror returned no results (may require JS)"
+        fi
+    else
+        echo "  Ahmia .onion mirror unreachable"
+    fi
+
+    # Strategy 3: TORCH .onion search engine
+    echo "[3/4] Trying TORCH search engine..."
+    local torch_results
+    torch_results=$(curl --socks5-hostname "$TOR_PROXY" \
+        -s -L \
+        --max-time 25 \
+        -H "User-Agent: Mozilla/5.0 (Windows NT 10.0; rv:128.0) Gecko/20100101 Firefox/128.0" \
+        -- "http://xmh57jrknzkhv6y3ls3ubitzfqnkrwxhopf5aygthi7d6rplyvk3noyd.onion/cgi-bin/omega/omega?P=${encoded_query}" 2>/dev/null || echo "")
+
+    if [ -n "$torch_results" ]; then
+        local torch_onions
+        torch_onions=$(echo "$torch_results" | grep -oiE 'https?://[a-z2-7]{16,56}\.onion[^ "<>]*' \
+            | grep -v 'xmh57jrknzkhv6y3ls3ubitzfqnkrwxhopf5aygthi7d6rplyvk3noyd' \
+            | sort -u || true)
+        if [ -n "$torch_onions" ]; then
+            echo "  Found results via TORCH"
+            all_onions="${all_onions}${torch_onions}"$'\n'
+        else
+            echo "  TORCH returned no results"
+        fi
+    else
+        echo "  TORCH unreachable"
+    fi
+
+    # Strategy 4: Surface web discovery (search for .onion references on clearnet)
+    echo "[4/4] Searching surface web for .onion references..."
+    local surface_onions=""
+
+    # Try DuckDuckGo HTML (lite version works without JS)
+    local ddg_results
+    ddg_results=$(curl -s -L --max-time 15 \
+        -H "User-Agent: Mozilla/5.0 (Windows NT 10.0; rv:128.0) Gecko/20100101 Firefox/128.0" \
+        -- "https://html.duckduckgo.com/html/?q=${encoded_query}+.onion+site" 2>/dev/null || echo "")
+
+    if [ -n "$ddg_results" ]; then
+        local ddg_onions
+        ddg_onions=$(echo "$ddg_results" | grep -oiE '[a-z2-7]{16,56}\.onion' | sort -u || true)
+        if [ -n "$ddg_onions" ]; then
+            # Prefix with http:// for bare addresses
+            ddg_onions=$(echo "$ddg_onions" | while read -r addr; do echo "http://${addr}"; done)
+            echo "  Found .onion references via DuckDuckGo"
+            surface_onions="${surface_onions}${ddg_onions}"$'\n'
+        fi
+    fi
+
+    # Try a second DDG query with different terms
+    local ddg_results2
+    ddg_results2=$(curl -s -L --max-time 15 \
+        -H "User-Agent: Mozilla/5.0 (Windows NT 10.0; rv:128.0) Gecko/20100101 Firefox/128.0" \
+        -- "https://html.duckduckgo.com/html/?q=${encoded_query}+%22.onion%22+hidden+service+tor" 2>/dev/null || echo "")
+
+    if [ -n "$ddg_results2" ]; then
+        local ddg_onions2
+        ddg_onions2=$(echo "$ddg_results2" | grep -oiE '[a-z2-7]{16,56}\.onion' | sort -u || true)
+        if [ -n "$ddg_onions2" ]; then
+            ddg_onions2=$(echo "$ddg_onions2" | while read -r addr; do echo "http://${addr}"; done)
+            surface_onions="${surface_onions}${ddg_onions2}"$'\n'
+        fi
+    fi
+
+    if [ -n "$surface_onions" ]; then
+        all_onions="${all_onions}${surface_onions}"
+    else
+        echo "  No .onion references found on surface web"
+    fi
+
+    echo ""
+
+    # Deduplicate and display all discovered .onion URLs
+    local final_onions
+    final_onions=$(echo "$all_onions" | grep -iE '\.onion' | sort -u || true)
+
+    if [ -n "$final_onions" ]; then
+        local count
+        count=$(echo "$final_onions" | wc -l)
+        echo "=== Discovered ${count} unique .onion URL(s) ==="
+        echo "$final_onions"
+    else
+        echo "No .onion URLs found for this query across any source."
+        echo ""
+        echo "Suggestions:"
+        echo "  - Try broader search terms"
+        echo "  - Use 'crawl' on known .onion directories (Hidden Wiki, Dark.fail)"
+        echo "  - Use the agent's web_search tool for surface web .onion discovery"
+    fi
+}
+
+# Legacy alias
+search_ahmia() {
+    search_darkweb "$@"
 }
 
 crawl_site() {
@@ -342,7 +455,7 @@ case "${1:-help}" in
         ;;
     search)
         [ -z "${2:-}" ] && { echo "Usage: $0 search <query>"; exit 1; }
-        search_ahmia "$2"
+        search_darkweb "$2"
         ;;
     crawl)
         [ -z "${2:-}" ] && { echo "Usage: $0 crawl <url> [depth]"; exit 1; }
@@ -356,7 +469,7 @@ case "${1:-help}" in
         echo "  start-tor               Start Tor and wait for bootstrap"
         echo "  extract-onions          Extract .onion URLs from stdin"
         echo "  fetch <url>             Fetch a URL through Tor with metadata"
-        echo "  search <query>          Search Ahmia for .onion results"
+        echo "  search <query>          Search for .onion results (multi-engine)"
         echo "  crawl <url> [depth]     Crawl an .onion site (depth 1-$MAX_CRAWL_DEPTH)"
         echo ""
         echo "Examples:"
